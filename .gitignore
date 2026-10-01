@@ -1,0 +1,28 @@
+# 私有任务、交接与学习材料
+local_private/
+
+# 虚拟环境、Python 缓存和构建产物
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+*.so
+*.pyd
+*.o
+*.obj
+
+# 凭据与原始运行、性能分析资料
+.env
+.env.*
+.netrc
+credentials.json
+*.pem
+*.key
+*.log
+profiles/raw/
+*.nsys-rep
+*.qdstrm
+*.ncu-rep
