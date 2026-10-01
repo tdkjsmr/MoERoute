@@ -3,6 +3,7 @@
 #include <c10/cuda/CUDAStream.h>
 #include <c10/cuda/CUDAException.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>  // 显式提供 CUDART_INF_F 等 CUDA 数学常量。
 #include <cmath>
 #include <vector>
 
