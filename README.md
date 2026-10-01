@@ -28,7 +28,7 @@ logits = torch.randn(17, 128, device="cuda", dtype=torch.float32)
 weights, expert_ids = fused_topk(logits, k=8)
 ```
 
-`routing.cu` 包含绑定、启动入口和内核；`router.py` 提供 FP64 数学参考；`check.py` 对照编号、权重和归一化。基线每 Warp 处理一行，每线程最多持有 8 项，通过成对归约重复选取。当前没有性能结果。
+`routing.cu` 包含绑定、启动入口和内核；`router.py` 提供 FP64 数学参考；`check.py` 对照编号、权重和归一化。基线每 Warp 处理一行，每线程最多持有 8 项，通过成对归约重复选取。
 
 ## 性能基线
 
@@ -42,3 +42,17 @@ python benchmark.py
 默认测量 30 个 T/E/K 组合，各预热 20 次、测量 5 组，每组 100 次。可先用 `python benchmark.py --tokens 1 1024 --experts 128 --topk 8 --groups 3` 做短测。
 
 两条路径共用输入，并在计时外核对输出。PyTorch 分步基线使用 FP32 全专家 Softmax、原 logits Top-K、收集与重归一化，包含 int32 编号转换；不以 FP64 正确性参考充当性能对手。记录 Event 流时间与包含调用、分配和末尾等待的墙钟时间，输出全部组样本及中位数。重复输入可能命中缓存，Event 也可能包含提交空隙；这不是纯内核时间、成熟融合基线或模型推理性能。
+
+时间线采集：`--profile` 仅接受单个 T/E/K，先检查与预热，再用 CUDA Profiler API 开关及 NVTX 标记采集各路径；不打印正式耗时。Nsight 原始文件放在已忽略的 `profiles/raw/`：
+
+```bash
+mkdir -p profiles/raw
+nsys profile --trace=cuda,nvtx --sample=none --cpuctxsw=none \
+  --capture-range=cudaProfilerApi --capture-range-end=stop \
+  --output=profiles/raw/router-t4096-e256-k8-01 \
+  python benchmark.py --profile --tokens 4096 --experts 256 --topk 8
+```
+
+先用本机 `nsys profile --help` 确认采集选项可用；重跑换报告编号，不覆盖旧报告。分析时查看 Kernel 持续时间与提交间隙，不能用带 Profiler 的时间替换普通基准结果。
+
+可选成熟基线：只在**已有** vLLM 0.29.0 环境中执行 `python benchmark.py --paths pytorch vllm`，无需加载模型或 MoERoute 扩展。调用原生 `topk_softmax` 并开启内部重归一化，计入三份输出/辅助张量分配。接口来源：[vLLM 0.29.0](https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/_custom_ops.py)。不自动安装依赖；不同 PyTorch/CUDA 环境的结果不能直接组成 MoERoute/vLLM 配对加速比。当前只是接口适配，仍待云端运行验证；特殊并列语义未作为跨实现等价契约。
