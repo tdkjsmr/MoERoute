@@ -17,24 +17,29 @@ __device__ __forceinline__ bool better(float value, int id, float best, int best
   return value > best || (value == best && id < best_id);
 }
 
+// 六种已支持的 E/K 组合分别编译，不在设备端使用动态循环边界。
+template <int Experts, int K>
 __global__ void routing_kernel(const float* logits, float* weights, int* ids,
-                               int64_t rows, int experts, int k) {
+                               int64_t rows) {
   const int lane = threadIdx.x % kWarp;
   const int64_t row = int64_t(blockIdx.x) * kWarpsPerBlock + threadIdx.x / kWarp;
   // 一整 Warp 负责同一行，因此尾部退出不会留下半个 Warp 参与 shuffle。
   if (row >= rows) return;
 
   // lane 负责 lane、lane+32……；E≤256，每线程至多保存八个候选。
-  float values[8];
-  float selected[8];
-  const int count = experts / kWarp;
+  constexpr int count = Experts / kWarp;
+  float values[count];
+  float selected[K];
+  #pragma unroll
   for (int slot = 0; slot < count; ++slot) {
-    values[slot] = logits[row * experts + lane + slot * kWarp];
+    values[slot] = logits[row * Experts + lane + slot * kWarp];
   }
 
-  for (int rank = 0; rank < k; ++rank) {
+  #pragma unroll
+  for (int rank = 0; rank < K; ++rank) {
     float best = -CUDART_INF_F;
-    int best_id = experts;
+    int best_id = Experts;
+    #pragma unroll
     for (int slot = 0; slot < count; ++slot) {
       const int id = lane + slot * kWarp;
       if (better(values[slot], id, best, best_id)) {
@@ -44,6 +49,7 @@ __global__ void routing_kernel(const float* logits, float* weights, int* ids,
     }
 
     // 所有 32 个线程都到达这里；归约后 lane 0 持有整行赢家。
+    #pragma unroll
     for (int offset = kWarp / 2; offset > 0; offset /= 2) {
       const float other = __shfl_down_sync(kFullMask, best, offset);
       const int other_id = __shfl_down_sync(kFullMask, best_id, offset);
@@ -56,10 +62,14 @@ __global__ void routing_kernel(const float* logits, float* weights, int* ids,
     const int winner_id = __shfl_sync(kFullMask, best_id, 0);
     if (lane == 0) {
       selected[rank] = winner;
-      ids[row * k + rank] = winner_id;
+      ids[row * K + rank] = winner_id;
     }
-    // 只由赢家所在的线程删去其寄存器候选，下一轮不会重复选择。
-    if (lane == winner_id % kWarp) values[winner_id / kWarp] = -CUDART_INF_F;
+    // 展开后每个候选槽的下标固定，避免按赢家编号动态寻址数组。
+    // 仍只有赢家对应的一项被移除；具体寄存器分配由编译器决定。
+    #pragma unroll
+    for (int slot = 0; slot < count; ++slot) {
+      if (winner_id == lane + slot * kWarp) values[slot] = -CUDART_INF_F;
+    }
   }
 
   if (lane == 0) {
@@ -67,11 +77,26 @@ __global__ void routing_kernel(const float* logits, float* weights, int* ids,
     // selected[0] 是最大值；极端有限差值可变为负无穷，exp 得到合法的零。
     const float maximum = selected[0];
     float sum = 0.0f;
-    for (int rank = 0; rank < k; ++rank) {
+    #pragma unroll
+    for (int rank = 0; rank < K; ++rank) {
       selected[rank] = expf(selected[rank] - maximum);
       sum += selected[rank];
     }
-    for (int rank = 0; rank < k; ++rank) weights[row * k + rank] = selected[rank] / sum;
+    #pragma unroll
+    for (int rank = 0; rank < K; ++rank) weights[row * K + rank] = selected[rank] / sum;
+  }
+}
+
+// 专家数由入口分派，K 只在宿主端分支；两条路径保持相同启动布局。
+template <int Experts>
+void launch_routing(const float* logits, float* weights, int* ids, int64_t rows,
+                    int64_t k, unsigned blocks, cudaStream_t stream) {
+  if (k == 2) {
+    routing_kernel<Experts, 2><<<blocks, kWarp * kWarpsPerBlock, 0, stream>>>(
+        logits, weights, ids, rows);
+  } else {
+    routing_kernel<Experts, 8><<<blocks, kWarp * kWarpsPerBlock, 0, stream>>>(
+        logits, weights, ids, rows);
   }
 }
 
@@ -92,9 +117,14 @@ std::vector<at::Tensor> fused_topk(const at::Tensor& logits, int64_t k) {
   auto ids = at::empty({rows, k}, logits.options().dtype(at::kInt));
   const auto stream = c10::cuda::getCurrentCUDAStream(logits.get_device());
   const unsigned blocks = static_cast<unsigned>((rows + kWarpsPerBlock - 1) / kWarpsPerBlock);
-  routing_kernel<<<blocks, kWarp * kWarpsPerBlock, 0, stream.stream()>>>(
-      logits.data_ptr<float>(), weights.data_ptr<float>(), ids.data_ptr<int>(), rows,
-      static_cast<int>(experts), static_cast<int>(k));
+  const float* input = logits.data_ptr<float>();
+  float* output = weights.data_ptr<float>();
+  int* output_ids = ids.data_ptr<int>();
+  switch (experts) {
+    case 64: launch_routing<64>(input, output, output_ids, rows, k, blocks, stream.stream()); break;
+    case 128: launch_routing<128>(input, output, output_ids, rows, k, blocks, stream.stream()); break;
+    case 256: launch_routing<256>(input, output, output_ids, rows, k, blocks, stream.stream()); break;
+  }
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return {weights, ids};
 }
