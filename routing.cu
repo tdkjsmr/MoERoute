@@ -48,27 +48,26 @@ __global__ void routing_kernel(const float* logits, float* weights, int* ids,
       }
     }
 
-    // 所有 32 个线程都到达这里；归约后 lane 0 持有整行赢家。
+    // 蝶形归约：每轮与 lane ^ offset 交换，五轮后所有 lane 都持有整行赢家。
+    // 分数与编号成对归约，仍按分数降序、相等时小编号优先，无需再广播。
     #pragma unroll
     for (int offset = kWarp / 2; offset > 0; offset /= 2) {
-      const float other = __shfl_down_sync(kFullMask, best, offset);
-      const int other_id = __shfl_down_sync(kFullMask, best_id, offset);
+      const float other = __shfl_xor_sync(kFullMask, best, offset);
+      const int other_id = __shfl_xor_sync(kFullMask, best_id, offset);
       if (better(other, other_id, best, best_id)) {
         best = other;
         best_id = other_id;
       }
     }
-    const float winner = __shfl_sync(kFullMask, best, 0);
-    const int winner_id = __shfl_sync(kFullMask, best_id, 0);
     if (lane == 0) {
-      selected[rank] = winner;
-      ids[row * K + rank] = winner_id;
+      selected[rank] = best;
+      ids[row * K + rank] = best_id;
     }
     // 展开后每个候选槽的下标固定，避免按赢家编号动态寻址数组。
     // 仍只有赢家对应的一项被移除；具体寄存器分配由编译器决定。
     #pragma unroll
     for (int slot = 0; slot < count; ++slot) {
-      if (winner_id == lane + slot * kWarp) values[slot] = -CUDART_INF_F;
+      if (best_id == lane + slot * kWarp) values[slot] = -CUDART_INF_F;
     }
   }
 

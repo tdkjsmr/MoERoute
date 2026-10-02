@@ -18,7 +18,7 @@ python setup.py build_ext --inplace
 python check.py
 ```
 
-源码目标为 RTX 3090（sm_86）、C++17；此前基线已在 Python 3.12、PyTorch 2.5.1+cu124、CUDA Toolkit 12.4 环境完成云端编译与 11 个正确性用例。当前 E/K 编译期特化改动尚待云端重新编译和验证。
+源码目标为 RTX 3090（sm_86）、C++17；此前基线已在 Python 3.12、PyTorch 2.5.1+cu124、CUDA Toolkit 12.4 环境完成云端编译与 11 个正确性用例，E/K 编译期特化版已通过 30 形状基准的计时外输出对照。当前蝶形归约改动尚待云端重新编译和验证。
 
 ```python
 import torch
@@ -28,7 +28,7 @@ logits = torch.randn(17, 128, device="cuda", dtype=torch.float32)
 weights, expert_ids = fused_topk(logits, k=8)
 ```
 
-`routing.cu` 包含绑定、启动入口和内核；`router.py` 提供 FP64 数学参考；`check.py` 对照编号、权重和归一化。每 Warp 处理一行，每线程最多持有 8 项，通过成对归约重复选取。六种 E/K 组合在编译时特化，展开候选扫描、移除及归一化循环，不改变选择规则。
+`routing.cu` 包含绑定、启动入口和内核；`router.py` 提供 FP64 数学参考；`check.py` 对照编号、权重和归一化。每 Warp 处理一行，每线程最多持有 8 项，通过分数/编号成对的蝶形归约重复选取，各 lane 直接得到赢家，无需额外广播。六种 E/K 组合在编译时特化，展开候选扫描、移除及归一化循环，不改变选择规则。
 
 ## 性能基线
 
