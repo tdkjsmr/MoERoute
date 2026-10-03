@@ -14,9 +14,10 @@ setup(
             # 相对路径满足 setuptools 的源码清单要求。
             sources=["routing.cu"],
             extra_compile_args={
-                "cxx": ["-O3", "-std=c++17"],
+                # 语言标准交给当前 PyTorch 选择，兼容旧环境的 C++17 与新环境的 C++20。
+                "cxx": ["-O3"],
                 "nvcc": [
-                    "-O3", "-std=c++17",
+                    "-O3",
                     "-gencode=arch=compute_86,code=sm_86",
                     "--generate-line-info",
                 ],
