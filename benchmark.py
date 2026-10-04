@@ -1,4 +1,4 @@
-"""云端路由调用基线：融合算子对照 FP32 PyTorch 分步实现，不测模型。"""
+"""路由调用基准：融合算子对照 FP32 PyTorch 分步实现，不测模型。"""
 
 import argparse
 import statistics
@@ -33,7 +33,7 @@ def vllm_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
 
 
 def profile(paths, logits, k, iterations) -> None:
-    """准备与预热已结束；只采集两条调用路径，不产生正式耗时样本。"""
+    """准备与预热已结束；采集指定调用路径，不产生正式耗时样本。"""
     torch.cuda.profiler.start()
     try:
         for name, fn in paths:

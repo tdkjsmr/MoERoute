@@ -15,7 +15,7 @@ def reference(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
 
 def fused_topk(logits: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]:
     """连续 CUDA FP32 [T,E] → FP32 权重、int32 编号 [T,K]。"""
-    # 延迟导入使数学参考可以独立使用；编译由云端命令显式完成。
+    # 延迟导入使数学参考可以独立使用；融合算子依赖提前编译的扩展。
     import _moe_router
 
     return _moe_router.fused_topk(logits, k)

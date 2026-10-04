@@ -1,4 +1,4 @@
-"""构建独立路由扩展；在已有 PyTorch 环境的 CUDA 服务器上执行。"""
+"""在已有 PyTorch 环境中构建 CUDA 路由扩展。"""
 
 from setuptools import setup
 from torch.utils.cpp_extension import BuildExtension, CUDAExtension
@@ -14,7 +14,7 @@ setup(
             # 相对路径满足 setuptools 的源码清单要求。
             sources=["routing.cu"],
             extra_compile_args={
-                # 语言标准交给当前 PyTorch 选择，兼容旧环境的 C++17 与新环境的 C++20。
+                # C++ 语言标准由当前 PyTorch 构建工具选择。
                 "cxx": ["-O3"],
                 "nvcc": [
                     "-O3",

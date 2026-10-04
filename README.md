@@ -18,7 +18,7 @@ python setup.py build_ext --inplace
 python check.py
 ```
 
-源码目标为 RTX 3090（sm_86），C++ 语言标准由当前 PyTorch 构建工具选择。本轮验证组合为 PyTorch 2.13.0+cu130、CUDA Toolkit 13.0.48、RTX 3090；11 个正确性用例通过，覆盖随机形状、并列、接近值和极端有限值。此前 cu124 环境结果保留为历史，不与本轮拼接计算加速比。
+源码目标为 RTX 3090（sm_86），C++ 语言标准由当前 PyTorch 构建工具选择。已验证环境为 PyTorch 2.13.0+cu130、CUDA Toolkit 13.0.48、RTX 3090；11 个正确性用例通过，覆盖随机形状、并列、接近值和极端有限值。不同工具链下的独立测量不用于计算配对加速比。
 
 ```python
 import torch
