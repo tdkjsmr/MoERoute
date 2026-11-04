@@ -1,8 +1,8 @@
 # MoERoute：MoE 路由融合算子
 
-把每个 Token 的专家分数转换为 Top-K 专家编号与重归一化权重。一个 CUDA Kernel 完成选择和权重处理，无需加载模型。
+把每个 Token 的专家分数转换为 Top-K 专家编号与重归一化权重。支持标准 Softmax 路由和固定配置的分组偏置 sigmoid 路由，各用一个 CUDA Kernel 完成选择和权重处理，无需加载模型。
 
-支持连续 CUDA FP32 输入 `[T,E]`，`T≥1`、`E=64/128/256`、`K=2/8`；启动网格受 CUDA x 维上限约束。输入约定为有限值，输出权重 FP32、编号 int32，均为 `[T,K]`。按原始 logits 降序选取，相等时较小编号优先。
+标准路由支持连续 CUDA FP32 输入 `[T,E]`，`T≥1`、`E=64/128/256`、`K=2/8`；启动网格受 CUDA x 维上限约束。输入约定为有限值，输出权重 FP32、编号 int32，均为 `[T,K]`。按原始 logits 降序选取，相等时较小编号优先。
 
 数学参考执行全专家 Softmax、选取和重归一化；融合实现利用分母消去，先选 Top-K 再只对 K 项做稳定 Softmax。此变换要求重归一化开启。本版本只覆盖前向标准路由，不包含 Gate/Expert GEMM、Dispatch/Combine、反向或完整模型接入。
 
@@ -18,7 +18,7 @@ python setup.py build_ext --inplace
 python check.py
 ```
 
-源码目标为 RTX 3090（sm_86），C++ 语言标准由当前 PyTorch 构建工具选择。已验证环境为 PyTorch 2.13.0+cu130、CUDA Toolkit 13.0.48、RTX 3090；11 个正确性用例通过，覆盖随机形状、并列、接近值和极端有限值。不同工具链下的独立测量不用于计算配对加速比。
+源码目标为 RTX 3090（sm_86），C++ 语言标准由当前 PyTorch 构建工具选择。历史标准路由已在 PyTorch 2.13.0+cu130、CUDA Toolkit 13.0.48、RTX 3090 通过 11 个用例。本轮分组路由、out 入口和标准回归均待重新编译及云端验证；不同工具链下的独立测量不计算配对加速比。
 
 ```python
 import torch
@@ -29,6 +29,22 @@ weights, expert_ids = fused_topk(logits, k=8)
 ```
 
 `routing.cu` 包含绑定、启动入口和内核；`router.py` 提供 FP64 数学参考；`check.py` 对照编号、权重和归一化。每 Warp 处理一行，每线程最多持有 8 项，通过分数/编号成对的蝶形归约重复选取，各 lane 直接得到赢家，无需额外广播。六种 E/K 组合在编译时特化，展开候选扫描、移除及归一化循环，不改变选择规则。
+
+## 固定分组路由
+
+语义来源为 DeepSeek-V3 固定提交 `9b4e9788` 的 [Gate](https://github.com/deepseek-ai/DeepSeek-V3/blob/9b4e9788e4a3a731f7567338ed15d3ec549ce03b/inference/model.py#L498-L557) 与 [671B 配置](https://github.com/deepseek-ai/DeepSeek-V3/blob/9b4e9788e4a3a731f7567338ed15d3ec549ce03b/inference/configs/config_671B.json)，官方代码为 [MIT 许可](https://github.com/deepseek-ai/DeepSeek-V3/blob/9b4e9788e4a3a731f7567338ed15d3ec549ce03b/LICENSE-CODE)。依据其有偏置分支独立实现，不复制完整模型或官方内核。
+
+固定输入为 FP32 `[T,256]` logits 与 FP32 `[256]` 修正偏置。先求 `p=sigmoid(logits)`，用 `p+bias` 的组内前两项之和选 4/8 组，再从保留组中选 8 个专家；输出从原始 `p` 收集，归一化后乘 `2.5`。本地同分优先小组号/专家号，编号按修正分数降序；不承诺外部库的并列顺序，不训练偏置。
+
+```python
+import torch
+from router import fused_grouped_topk
+
+bias = torch.zeros(256, device="cuda", dtype=torch.float32)
+weights, expert_ids = fused_grouped_topk(torch.randn(17, 256, device="cuda"), bias)
+```
+
+有效权重要求有限输入及选中 sigmoid 分数总量非零。零质量输入保留原定义的 `0/0→NaN`，不静默加 epsilon 或改成 Softmax；`check.py` 将其单列诊断。FP64 参考在 sigmoid 和偏置运算前升精度，近边界的跨精度排序差异单独检查。
 
 ## 性能基线
 
@@ -49,7 +65,16 @@ python benchmark.py --paths pytorch fused vllm
 
 vLLM 调用原生 [`topk_softmax`](https://github.com/vllm-project/vllm/blob/v0.29.0/vllm/_custom_ops.py)，开启 `renormalize=True`，计入三份输出/辅助张量分配。所有路径共用输入，分别对照 FP64 参考；特殊并列语义不作为跨实现等价契约。
 
-### 已测结果
+本轮新增两组独立基准，尚无测量结论：
+
+```bash
+python benchmark.py --routing grouped
+python benchmark.py --compare-out --groups 8
+```
+
+分组默认只测 `T=1/128/4096`、E256/K8，对照匹配语义的 FP32 PyTorch 分步实现，不拿标准 `topk_softmax` 作对手。`--compare-out` 默认测标准路由 `T=1/1024/4096`、E256/K8，保留双方正常调用及预分配调用。`fused_topk_out(logits,k,weights,ids)` 要求连续、同设备且互不重叠的 `[T,K]` 输出；vLLM 预分配也保留辅助编号。out 循环直接调用扩展，normal/out 差异还包含入口包装与检查差异，不是仅分配的互斥归因。测量组轮换各入口起始位置。
+
+### 历史标准路由结果
 
 报告编号 `M4-3090-cu130`（本页归档标识），源码提交 [0e40b789a64452d3f5186b626b307ea9cadb2a4a](https://github.com/tdkjsmr/MoERoute/commit/0e40b789a64452d3f5186b626b307ea9cadb2a4a)。环境为上述 RTX 3090/cu130 组合及 vLLM 0.29.0；FP32 正态输入、种子 0，未启用 Graph、torch.compile 或预分配输出。
 
@@ -66,7 +91,7 @@ vLLM 调用原生 [`topk_softmax`](https://github.com/vllm-project/vllm/blob/v0.
 
 本次 30 个形状中，MoERoute 调用墙钟中位数为 7.212～12.679 μs；PyTorch/MoERoute 耗时比为 6.95～15.25×，vLLM/MoERoute 为 1.80～3.09×。
 
-边界：计时包含正常调用、输出分配和组末等待，vLLM 还包含辅助输出；Event 也可能含宿主提交空隙。反复读取同一输入可能命中缓存；五组仅为少量重复，三路径顺序只首尾反转、融合固定居中。结果不是纯内核加速比、完整 MoE/模型推理性能或服务吞吐；不同软件栈的独立结果不能组成配对加速比。
+本表边界：计时包含正常调用、输出分配和组末等待，vLLM 还包含辅助输出；Event 也可能含宿主提交空隙。反复读取同一输入可能命中缓存；该次五组中三路径只首尾反转、融合固定居中。结果不是纯内核加速比、完整 MoE/模型推理性能或服务吞吐，不用于新分组路由或 out 入口。
 
 时间线采集：`--profile` 仅接受单个 T/E/K，先检查与预热，再用 CUDA Profiler API 开关及 NVTX 标记采集各路径；不打印正式耗时。Nsight 原始文件放在已忽略的 `profiles/raw/`：
 
